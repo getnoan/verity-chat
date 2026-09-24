@@ -1,0 +1,12 @@
+{
+  "name": "verity-site",
+  "private": true,
+  "version": "1.0.0",
+  "description": "The site chat surface: a grounded assistant for a public website",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node ../agents/test-site-chat.mjs"
+  }
+}

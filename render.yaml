@@ -1,0 +1,42 @@
+# One-blueprint deploy (the blessed path — INSTALL.md walks a coding agent through it).
+services:
+  - type: web
+    name: verity-chat
+    runtime: node
+    plan: starter
+    buildCommand: "echo no-build"
+    startCommand: node site-web/server.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: SITE_ALLOWED_ORIGINS
+        sync: false
+      - key: SITE_NAME
+        sync: false
+      - key: AGENT_NAME
+        sync: false
+      - key: NOAN_AGENT_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SITE_CHAT_CONFIG_BLOCK_SLUG
+        sync: false
+      - key: SITE_CHAT_PLAYBOOK_BLOCK_SLUG
+        sync: false
+      - key: SITE_CHAT_PAUSE_BLOCK_SLUG
+        sync: false
+      - key: SITE_CHAT_GROUNDING_SLUGS
+        sync: false
+      - key: SITE_DAILY_BUDGET_USD
+        value: "20"
+      - key: ESCALATE_TO
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
