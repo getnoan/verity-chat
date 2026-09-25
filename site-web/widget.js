@@ -33,7 +33,9 @@
     try { return JSON.parse(SS.getItem(KEY)) || {}; } catch { return {}; }
   })();
   state.history = Array.isArray(state.history) ? state.history : [];
-  state.sessionId = state.sessionId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 8));
+  // Not a secret (the server keys it with the signed contact id), but unguessable costs nothing.
+  // getRandomValues, not randomUUID: the embed may sit on a plain-http page, where randomUUID is absent.
+  state.sessionId = state.sessionId || Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, "0")).join("");
   const save = () => { try { SS.setItem(KEY, JSON.stringify(state)); } catch {} };
 
   /* ---------------- shell ---------------- */
