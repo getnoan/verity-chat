@@ -10,6 +10,13 @@
  *   POST /contact     resolve the visitor's contact, return a signed session token
  *   POST /chat        streaming reply (SSE)
  *   POST /chat-end    conversation wrap-up — memo + routed tasks
+ *
+ * THE APPLICATION PAGE (SITE_CHAT_APPLICATION_PAGE, the program in a fact). On that page
+ * the chat IS the application form: the brain interviews the visitor against the program's
+ * published criteria and ends the completing reply with a GRANT_APPLICATION control line.
+ * This server tags the contact (SITE_GRANT_TAG_ID, "Grant Applicant" by name otherwise),
+ * writes the answers to the contact as a memo, and files a backlog task tagged the same,
+ * unassigned: awarding a grant is a human decision, so no agent trigger shape.
  *   GET  /healthz
  *
  * IDENTITY. Every write takes the signed token, never a caller-supplied contactId. See
@@ -28,7 +35,8 @@
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 import {
-  assertNoanKey, findOrCreateContactByEmail, noanPost, noanPut, findTagId,
+  assertNoanKey, findOrCreateContactByEmail, noanGet, noanPost, noanPut, noanPatch, findTagId,
+  addContactMemo,
 } from "../agents/noan.mjs";
 import { callClaudeStream } from "../agents/anthropic.mjs";
 import { readUsage, setUsageContext } from "../agents/usage-log.mjs";
@@ -36,7 +44,7 @@ import { sendEmail } from "../agents/resend.mjs";
 import { createBudgetGate, describeBudget } from "./budget.mjs";
 import {
   brain, paused, systemBlocks, createMarkerFilter, prepareTurns, SUPPORT_TASK_RX,
-  cleanPage, groundingLabels,
+  cleanPage, groundingLabels, parseGrantLine, applicationPage,
 } from "./site-chat.mjs";
 import { issueChatToken, verifyChatToken } from "./site-token.mjs";
 import { agentName, agentIdentityId } from "../agents/required-env.mjs";
@@ -60,6 +68,10 @@ const VERITY_ID = agentIdentityId();
  * match below, which needs no id at all. */
 const LEAD_TAG_ID = (process.env.SITE_LEAD_TAG_ID || "").trim() || null;
 const SUBSCRIBER_TAG_ID = (process.env.SITE_SUBSCRIBER_TAG_ID || "").trim() || null;
+/* The applicant tag. Env pins the id (the pack rule); unset, it is resolved by NAME at
+ * file time, so a downstream copy only needs a tag called this. */
+const GRANT_TAG_ID = (process.env.SITE_GRANT_TAG_ID || "").trim() || null;
+const GRANT_TAG_NAME = (process.env.SITE_GRANT_TAG_NAME || "").trim() || "Grant Applicant";
 
 const ALLOWED_ORIGINS = (process.env.SITE_ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -184,12 +196,16 @@ async function handleChat(req, res) {
   const id = verifyChatToken(body.token);
   const audience = id?.isSubscriber ? "subscriber" : "prospect";
   const page = cleanPage(body.page);
+  // The client's flag rides the session like supportTaskCreated; the in-process map is
+  // the second guard, for a tab that lost its session but not its transcript.
+  const grantAlready = body.grantFiled === true || (id ? grantFiledRecently(id.contactId) : false);
   const system = await systemBlocks({
     audience,
     email: id?.email,
     name: clean(body.name, 120) || undefined,
     supportTaskCreated: body.supportTaskCreated === true,
     page,
+    grantFiled: grantAlready,
   });
 
   res.writeHead(200, {
@@ -230,16 +246,30 @@ async function handleChat(req, res) {
     // double-counts the spend, which would trip the daily budget at half its value.
     void out;
 
-    const { reply, supportTaskCreated } = await applySupportLine(raw, {
+    const support = await applySupportLine(raw, {
       isSubscriber: audience === "subscriber",
       contactId: id?.contactId,
       email: id?.email,
       already: body.supportTaskCreated === true,
     });
-    if (supportTaskCreated && body.supportTaskCreated !== true) {
+    if (support.supportTaskCreated && body.supportTaskCreated !== true) {
       send({ trace: { glyph: "\u270e", label: "task", detail: "support case opened for the team", tone: "write" } });
     }
-    send({ done: true, reply: reply || "Sorry, I didn't catch that.", supportTaskCreated });
+    const grant = await applyGrantLine(support.reply, {
+      contactId: id?.contactId,
+      email: id?.email,
+      page,
+      already: grantAlready,
+    });
+    if (grant.grantFiled && !grantAlready) {
+      send({ trace: { glyph: "\u270e", label: "application", detail: `grant application filed for the team \u00b7 tagged ${GRANT_TAG_NAME}`, tone: "write" } });
+    }
+    send({
+      done: true,
+      reply: grant.reply || "Sorry, I didn't catch that.",
+      supportTaskCreated: support.supportTaskCreated,
+      grantFiled: grant.grantFiled,
+    });
   } catch (e) {
     console.error("[site-chat] reply failed:", e.message);
     send({ error: "Reply failed." });
@@ -272,6 +302,110 @@ async function applySupportLine(rawText, ctx) {
     console.error("[site-chat] control line failed:", e.message);
     return { reply, supportTaskCreated: ctx.already };
   }
+}
+
+/* ---------------- GRANT_APPLICATION control line ----------------
+ * Token-verified contacts only (any audience: applicants are prospects by definition), on
+ * the application page only, once per contact per day. The line is stripped from the reply
+ * whatever happens; what the visitor was told stands, so a failed write is escalated by
+ * email rather than swallowed. */
+const GRANT_TTL_MS = 24 * 60 * 60_000;
+const grantsFiled = new Map();   // contactId -> at
+
+function grantFiledRecently(contactId) {
+  const at = grantsFiled.get(contactId);
+  if (!at) return false;
+  if (Date.now() - at > GRANT_TTL_MS) { grantsFiled.delete(contactId); return false; }
+  return true;
+}
+
+function applicationLines(a, email) {
+  const yn = v => (v ? "yes" : "no");
+  return [
+    `Company: ${a.company || "(not given)"}`,
+    `Website: ${a.website || "(not given)"}`,
+    `Applicant email: ${email}`,
+    `What they build: ${a.product || "(not given)"}`,
+    `Sells to: ${a.customers}`,
+    `Team size: ${a.headcount || "(not given)"}`,
+    `Founded: ${a.founded || "(not given)"}`,
+    `Stage: ${a.stage}`,
+    `Agents: ${a.agents || "(not given)"}`,
+    `Client deployments: ${a.clientDeployments || "(not given)"}`,
+    `Technical owner: ${a.technicalOwner || "(not given)"}`,
+    `Existing customer: ${yn(a.existingCustomer)}`,
+    `Accepts the program's asks: ${yn(a.acceptsAsks)}`,
+    ...(a.notes ? [`Notes: ${a.notes}`] : []),
+  ];
+}
+
+async function applyGrantLine(rawText, ctx, file = fileGrantApplication) {
+  const { reply, application } = parseGrantLine(rawText);
+  if (!application) return { reply: rawText, grantFiled: ctx.already === true };
+  const appPage = applicationPage();
+  if (!ctx.contactId || !ctx.email || !appPage || ctx.page !== appPage || ctx.already) {
+    return { reply, grantFiled: ctx.already === true };
+  }
+  grantsFiled.set(ctx.contactId, Date.now());
+  const lines = applicationLines(application, ctx.email);
+  try {
+    await file({ contactId: ctx.contactId, email: ctx.email, application, lines });
+    return { reply, grantFiled: true };
+  } catch (e) {
+    console.error("[site-chat] grant application failed:", e.message);
+    // The visitor has been told it is filed. Put the answers in front of a person instead.
+    const text = `${agentName()} took a startup grant application on ${appPage} but writing it to NOAN failed (${e.message}).\n\n${lines.join("\n")}\n\nContact ID: ${ctx.contactId}`;
+    if (!ESCALATE_TO) console.error(`[site-chat] no ESCALATE_TO; application follows\n${text}`);
+    else sendEmail({
+      to: ESCALATE_TO, cc: false,
+      subject: `Grant application NOT filed for ${application.company || ctx.email}`,
+      text,
+      idempotencyKey: `site-chat:grant-failed:${ctx.contactId}:${new Date().toISOString().slice(0, 10)}`,
+    }).catch(() => {});
+    return { reply, grantFiled: true };
+  }
+}
+
+/** Contact tagged, website filled in if empty, answers on the record, task on the board. */
+async function fileGrantApplication({ contactId, email, application, lines }) {
+  const tagId = GRANT_TAG_ID || await findTagId(GRANT_TAG_NAME);
+  if (!tagId) throw new Error(`no "${GRANT_TAG_NAME}" tag: set SITE_GRANT_TAG_ID or create the tag`);
+
+  // Tag the contact. PATCH tagIds replaces the set, so read it first and add to it.
+  const full = await noanGet(`/contacts/${contactId}`);
+  const contact = full?.contact || full || {};
+  const current = (contact.tags || []).map(t => t.id).filter(Boolean);
+  const patch = { tagIds: [...new Set([...current, tagId])] };
+  if (!contact.website && application.website) patch.website = application.website;
+  await noanPatch(`/contacts/${contactId}`, patch);
+
+  await addContactMemo(
+    contactId,
+    `Startup grant application (${new Date().toISOString()}), taken by ${agentName()} in the site chat:\n\n${lines.join("\n")}`,
+    "Grant application",
+  ).catch(e => console.error("  grant memo failed:", e.message));
+
+  // The tag is how applications are found on the board, so a failed tag fails the
+  // request here (createRoutedTask only logs a miss).
+  const created = await noanPost("/tasks", {
+    title: `Grant application: ${application.company || application.host || email}`.slice(0, 200),
+    details: [
+      `Startup grant application, taken in the site chat on ${applicationPage() || "the application page"}.`,
+      "Awarding the grant is a human decision: review against the published criteria and reply to the applicant by email within a week.",
+      "",
+      ...lines,
+      "",
+      `Contact ID: ${contactId}`,
+      `Source: site chat, ${applicationPage() || "application page"}`,
+    ].join("\n").slice(0, 2048),
+    status: "backlog",
+    externalId: `site-grant:${contactId}`,
+  });
+  const taskId = created?.task?.id || created?.id;
+  if (!taskId) throw new Error("task create returned no id");
+  await noanPut(`/tasks/${taskId}/tags`, { tagIds: [tagId] });
+  await noanPut(`/tasks/${taskId}/contacts`, { contactIds: [contactId] }).catch(e => console.error("  contact link failed:", e.message));
+  return taskId;
 }
 
 /** A backlog task, tagged and optionally assigned to the agent, with the contact linked. Tag +
@@ -341,6 +475,7 @@ async function handleChatEnd(req, res) {
     const r = await wrapUp({
       identity: id, turns, createRoutedTask,
       alreadySupported: body.supportTaskCreated === true,
+      grantFiled: body.grantFiled === true || grantFiledRecently(id.contactId),
       externalIdBase: `site-chat:${id.contactId}:${sessionId}`,
     });
     json(res, 200, { ok: true, ...r });
@@ -416,4 +551,4 @@ if (process.env.NODE_ENV !== "test") {
   });
 }
 
-export { server, route, createRoutedTask };
+export { server, route, createRoutedTask, applyGrantLine };
