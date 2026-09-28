@@ -15,6 +15,14 @@ import { noanGet } from "../agents/noan.mjs";
 export const SUPPORT_TASK_MARKER = "SUPPORT_TASK:";
 export const SUPPORT_TASK_RX = /\s*SUPPORT_TASK:\s*(\{[\s\S]*?\})\s*$/;
 
+/* The application (the application page, see applicationPage below). Same mechanics as the
+ * support case: the model ends the reply that completes the application with a control line
+ * the visitor never sees, and the server acts on it once. Unlike SUPPORT_TASK it is open to
+ * prospects: the whole point of the page is that a stranger with a company email can apply. */
+export const GRANT_MARKER = "GRANT_APPLICATION:";
+export const GRANT_RX = /\s*GRANT_APPLICATION:\s*(\{[\s\S]*?\})\s*$/;
+export const CONTROL_MARKERS = [SUPPORT_TASK_MARKER, GRANT_MARKER];
+
 const CONFIG_SLUG = process.env.SITE_CHAT_CONFIG_BLOCK_SLUG;
 const PLAYBOOK_SLUG = process.env.SITE_CHAT_PLAYBOOK_BLOCK_SLUG;
 const PAUSE_SLUG = process.env.SITE_CHAT_PAUSE_BLOCK_SLUG;
@@ -85,9 +93,10 @@ let brainCache = { at: 0, brain: null };
 
 export async function brain() {
   if (brainCache.brain && Date.now() - brainCache.at < BRAIN_TTL_MS) return brainCache.brain;
-  const [config, playbook] = await Promise.all([
+  const [config, playbook, application] = await Promise.all([
     factText(CONFIG_SLUG),
     factText(PLAYBOOK_SLUG).catch(() => ""),
+    factText(APPLICATION_SLUG).catch(() => ""),
   ]);
   if (!config) {
     // A NOAN blip must never degrade a live surface, but booting un-instructed is worse
@@ -96,7 +105,7 @@ export async function brain() {
     if (brainCache.brain) return brainCache.brain;
     throw new Error(`No fact in SITE_CHAT_CONFIG_BLOCK_SLUG '${CONFIG_SLUG}'. Refusing to run un-instructed.`);
   }
-  brainCache = { at: Date.now(), brain: { config, playbook } };
+  brainCache = { at: Date.now(), brain: { config, playbook, application } };
   return brainCache.brain;
 }
 
@@ -271,8 +280,103 @@ export function pageContext(page) {
  * goes after it. Built the other way round, every turn re-bills the whole prefix and
  * cache_read stays at zero forever. */
 
-export async function systemBlocks({ audience, email, name, supportTaskCreated, page }) {
-  const { config, playbook } = await brain();
+/* ---------------- the application page ----------------
+ * One page of the site can be an application form that the chat takes: the startup grant
+ * on ours. Which page (SITE_CHAT_APPLICATION_PAGE) and what the program is (a fact,
+ * SITE_CHAT_APPLICATION_BLOCK_SLUG: the offer, the published criteria, the asks in return)
+ * both come from outside the code, so the program is a fact edit and the code names no
+ * product. Unset, the page is just a page. Per-visitor block, not the cached prefix: it only
+ * applies on one page, and putting it in the prefix would fork the cache. */
+const APPLICATION_SLUG = process.env.SITE_CHAT_APPLICATION_BLOCK_SLUG;
+
+export function applicationPage() {
+  return cleanPage(process.env.SITE_CHAT_APPLICATION_PAGE) || null;
+}
+
+export const GRANT_STAGES = ["bootstrapped", "pre-seed", "seed", "series-a", "series-b", "later", "unknown"];
+export const GRANT_CUSTOMERS = ["b2b", "b2c", "both", "unknown"];
+
+export function grantBlock({ filed = false, program = "" } = {}) {
+  const PROGRAM = `## PROGRAM (the offer, the published criteria, the asks in return)\n${program.trim()}`;
+  if (filed) {
+    return [
+      "## Application: already filed",
+      "This visitor's application is already filed from this conversation. Do not take another. Answer questions about the program from PROGRAM below, and say the team reviews applications and replies by email within a week.",
+      "",
+      PROGRAM,
+    ].join("\n");
+  }
+  return [
+    "## Application mode",
+    "This page is the application for the program described under PROGRAM below. The visitor applies by talking to you. Run it as a short conversation, never as a form: one or two questions per turn, in your own voice, skipping anything they have already told you.",
+    "",
+    "Collect, in this order:",
+    "1. Company name and website.",
+    "2. What they build and who they sell to (businesses or consumers).",
+    "3. Team size, counting founders, and the year the company was founded.",
+    "4. Funding stage: bootstrapped, pre-seed, seed, Series A, Series B, or later.",
+    "5. How agents show up: in the product, in their internal stack, or not yet.",
+    "6. Whether they deploy into customers' workflows (forward-deployed or implementation engineers, per-client setups).",
+    "7. Whether someone on the team can hold an API key and put agents to work on their facts, whether the program's own agents or ones they build. A name or role is welcome, never required.",
+    "8. Whether they are already a paying customer.",
+    "9. The asks the program makes in return, as PROGRAM lists them. Read them out and ask whether they accept.",
+    "",
+    "Rules:",
+    "- Their email is already known. Never ask for it.",
+    "- Do not decide the outcome. Never say they are accepted or rejected, and never pre-screen them out. The team reviews every application and replies by email within a week.",
+    "- If they ask about eligibility, answer plainly from PROGRAM.",
+    "- When every item is collected and the asks are answered (accepted or declined, record either), read back a two-line summary, say the application is filed and the team replies within a week, and END that reply with the control line on its own last line, exactly in this shape:",
+    'GRANT_APPLICATION: {"company":"","website":"","product":"","customers":"b2b|b2c|both|unknown","headcount":0,"founded":0,"stage":"bootstrapped|pre-seed|seed|series-a|series-b|later|unknown","agents":"","clientDeployments":"","technicalOwner":"","existingCustomer":false,"acceptsAsks":true,"notes":""}',
+    "- Emit it once only, only when the application is complete, and never mention the control line or that anything is filed automatically.",
+    "",
+    PROGRAM,
+  ].join("\n");
+}
+
+/** Parse and bound a GRANT_APPLICATION payload. Everything is model-written text about a
+ *  stranger, headed for a contact record and a task the team reads, so every field is
+ *  clamped to a type and a length. Returns null when the payload is not an object. */
+export function normalizeApplication(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const str = (v, max) => String(v ?? "").replace(new RegExp("[\\u0000-\\u001f\\u007f<>]", "g"), " ").replace(/\s+/g, " ").trim().slice(0, max);
+  const int = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : 0; };
+  const pick = (v, allowed) => {
+    const k = str(v, 24).toLowerCase().replace(/[\s_]+/g, "-");
+    return allowed.includes(k) ? k : "unknown";
+  };
+  let website = str(raw.website, 200);
+  if (website && !/^https?:\/\//i.test(website)) website = `https://${website}`;
+  let host = "";
+  try { host = website ? new URL(website).hostname.toLowerCase().replace(/^www\./, "") : ""; } catch { host = ""; }
+  if (!host.includes(".")) { website = ""; host = ""; }
+  return {
+    company: str(raw.company, 120),
+    website, host,
+    product: str(raw.product, 600),
+    customers: pick(raw.customers, GRANT_CUSTOMERS),
+    headcount: Math.min(int(raw.headcount), 100000),
+    founded: (() => { const y = int(raw.founded); return y >= 1900 && y <= 2100 ? y : 0; })(),
+    stage: pick(raw.stage, GRANT_STAGES),
+    agents: str(raw.agents, 400),
+    clientDeployments: str(raw.clientDeployments, 400),
+    technicalOwner: str(raw.technicalOwner, 160),
+    existingCustomer: raw.existingCustomer === true || /^(true|yes)$/i.test(String(raw.existingCustomer ?? "")),
+    acceptsAsks: raw.acceptsAsks === true || /^(true|yes)$/i.test(String(raw.acceptsAsks ?? "")),
+    notes: str(raw.notes, 600),
+  };
+}
+
+/** Split a reply into the text the visitor sees and the application it carried, if any. */
+export function parseGrantLine(rawText) {
+  const m = String(rawText ?? "").match(GRANT_RX);
+  if (!m) return { reply: rawText, application: null };
+  const reply = String(rawText).replace(GRANT_RX, "").trim();
+  try { return { reply, application: normalizeApplication(JSON.parse(m[1])) }; }
+  catch { return { reply, application: null }; }
+}
+
+export async function systemBlocks({ audience, email, name, supportTaskCreated, page, grantFiled = false }) {
+  const { config, playbook, application } = await brain();
   const facts = await groundingText(audience);
 
   const stable = [
@@ -291,6 +395,10 @@ export async function systemBlocks({ audience, email, name, supportTaskCreated, 
   if (email) lines.push(`If they ask to be contacted, confirm you already have their email (${email}) and do NOT ask again.`);
   const where = pageContext(page);
   if (where) lines.push(where);
+  const appPage = applicationPage();
+  if (appPage && application && cleanPage(page) === appPage) {
+    lines.push("", grantBlock({ filed: grantFiled, program: application }));
+  }
   if (isSub) {
     lines.push(supportTaskCreated
       ? `A support case already exists for this conversation. Do NOT open another; reassure them the team will email them directly.`
@@ -306,18 +414,27 @@ export async function systemBlocks({ audience, email, name, supportTaskCreated, 
  * longest suffix that could still become the marker — at most marker.length - 1
  * characters, so normal text streams at full granularity. */
 
-export function createMarkerFilter(marker = SUPPORT_TASK_MARKER) {
+export function createMarkerFilter(marker = CONTROL_MARKERS) {
+  const markers = Array.isArray(marker) ? marker : [marker];
   let held = "";
   let seen = false;
   return {
     push(chunk) {
       if (seen) return "";
       held += chunk;
-      const at = held.indexOf(marker);
+      // Cut at the EARLIEST marker present; the others are moot once one has started.
+      let at = -1;
+      for (const m of markers) {
+        const i = held.indexOf(m);
+        if (i !== -1 && (at === -1 || i < at)) at = i;
+      }
       if (at !== -1) { seen = true; const out = held.slice(0, at); held = held.slice(at); return out; }
+      // Hold back the longest suffix that could still become ANY marker.
       let keep = 0;
-      for (let n = Math.min(marker.length - 1, held.length); n > 0; n -= 1) {
-        if (marker.startsWith(held.slice(held.length - n))) { keep = n; break; }
+      for (const m of markers) {
+        for (let n = Math.min(m.length - 1, held.length); n > keep; n -= 1) {
+          if (m.startsWith(held.slice(held.length - n))) { keep = n; break; }
+        }
       }
       const out = held.slice(0, held.length - keep);
       held = held.slice(held.length - keep);
