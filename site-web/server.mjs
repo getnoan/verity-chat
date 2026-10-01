@@ -33,7 +33,7 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import {
   assertNoanKey, findOrCreateContactByEmail, noanGet, noanPost, noanPut, noanPatch, findTagId,
   addContactMemo,
@@ -48,6 +48,16 @@ import {
 } from "./site-chat.mjs";
 import { issueChatToken, verifyChatToken } from "./site-token.mjs";
 import { agentName, agentIdentityId } from "../agents/required-env.mjs";
+import { fileURLToPath } from "node:url";
+/* Deployment-only routes: files that exist in our own deployment and not in a downstream copy.
+ * Each is looked up by a BUILT name, so the export's closure walk never reaches it, and a copy
+ * without the file simply answers 404 on the path. */
+async function optionalRoute(name, fn) {
+  const url = new URL(`./${name}` + ".mjs", import.meta.url);
+  if (!existsSync(fileURLToPath(url))) return null;
+  return (await import(url.href))[fn] || null;
+}
+const handleGrantActivate = await optionalRoute("grant-activate", "handleGrantActivate");
 
 /* The site this chat fronts, for copy only (e.g. "example.com"). */
 const SITE_NAME = (process.env.SITE_NAME || "").trim() || "the site";
@@ -513,6 +523,9 @@ async function route(req, res) {
     res.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Widget demo</title></head><body style="font-family:sans-serif;padding:40px"><h1>Chat widget demo</h1><p>The launcher should sit bottom-right. This page stands in for your website.</p><script src="/widget.js" async></script></body></html>`);
     return;
   }
+  /* A deployment-only route (optionalRoute above): a GET a person opens from an email, so no
+   * CORS and no token cookie; the signed query string is the whole credential. */
+  if (req.method === "GET" && url.pathname === "/grant/activate" && handleGrantActivate) return await handleGrantActivate(req, res, url);
   if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
 
   try {

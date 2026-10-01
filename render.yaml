@@ -28,6 +28,8 @@ services:
         sync: false
       - key: SITE_CHAT_GROUNDING_SLUGS
         sync: false
+      - key: SITE_CHAT_GROUNDING_STACKS
+        sync: false
       - key: SITE_DAILY_BUDGET_USD
         value: "20"
       - key: ESCALATE_TO
