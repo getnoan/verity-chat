@@ -35,6 +35,15 @@ const PAUSE_SLUG = process.env.SITE_CHAT_PAUSE_BLOCK_SLUG;
 const EXTERNAL_BLOCKS = (process.env.SITE_CHAT_GROUNDING_SLUGS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
+/* Stacks whose EVERY block grounds the chat, read whole (SITE_CHAT_GROUNDING_STACKS,
+ * comma-separated), so a block added later reaches visitors without an env edit. Pricing is
+ * the case this exists for: a hand list that names some plans and not a newer one lets the
+ * model borrow a paid plan's limits when asked about the missing plan, and it will state
+ * them as fact. Only name a stack here if nothing in it will ever be internal; a stack that
+ * mixes the two stays in SITE_CHAT_GROUNDING_SLUGS, block by block. */
+const EXTERNAL_STACKS = (process.env.SITE_CHAT_GROUNDING_STACKS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
 /* Optional: a stack whose every block grounds the chat (our Product Manual). Unset = no
  * manual section, and the audience gating below simply has nothing to gate. */
 const PRODUCT_MANUAL_STACK_SLUG = (process.env.SITE_CHAT_MANUAL_STACK_SLUG || "").trim();
@@ -136,19 +145,28 @@ export async function paused() {
 
 /* ---------------- grounding ---------------- */
 
-async function manualBlocks() {
+/* Every block slug in a stack, or [] if it cannot be read. The listing is scope-filtered, so a
+ * stack the key cannot reach comes back empty rather than erroring. A hand list at least
+ * names its slugs for reportMissingGrounding; a whole-stack read has nothing to name, so an
+ * empty stack is logged here or it drops out of the prompt in silence. */
+async function stackBlockSlugs(stackSlug) {
   try {
-    if (!PRODUCT_MANUAL_STACK_SLUG) return [];
-    const d = await noanGet(`/stacks?slug=${PRODUCT_MANUAL_STACK_SLUG}`);
-    const stack = (d.items || []).find(s => s.slug === PRODUCT_MANUAL_STACK_SLUG);
-    return (stack?.blocks || []).map(b => ({
-      slug: b.slug,
-      label: b.slug.replace(PRODUCT_MANUAL_STACK_SLUG ? `${PRODUCT_MANUAL_STACK_SLUG}-` : /^\0$/, "").replace(/^[0-9a-f]{5}-/, ""),
-    }));
+    const d = await noanGet(`/stacks?slug=${stackSlug}`);
+    const blocks = (d.items || []).find(s => s.slug === stackSlug)?.blocks || [];
+    if (!blocks.length) console.error(`[site-chat] grounding stack ${stackSlug} returned no blocks — out of scope for this key, or the slug is stale`);
+    return blocks.map(b => b.slug);
   } catch (e) {
-    log(`  warn: product manual stack lookup failed: ${e.message}`);
+    log(`  warn: stack lookup failed: ${stackSlug}: ${e.message}`);
     return [];
   }
+}
+
+async function manualBlocks() {
+  if (!PRODUCT_MANUAL_STACK_SLUG) return [];
+  return (await stackBlockSlugs(PRODUCT_MANUAL_STACK_SLUG)).map(slug => ({
+    slug,
+    label: slug.replace(`${PRODUCT_MANUAL_STACK_SLUG}-`, "").replace(/^[0-9a-f]{5}-/, ""),
+  }));
 }
 
 /**
@@ -205,9 +223,12 @@ export async function groundingText(audience = "prospect") {
   const hit = factsCache.get(audience);
   if (hit && Date.now() - hit.at < FACTS_TTL_MS) return hit.text;
 
-  const manual = await manualBlocks();
+  const [manual, ...stacks] = await Promise.all([manualBlocks(), ...EXTERNAL_STACKS.map(stackBlockSlugs)]);
+  // Every block here was chosen as customer-facing, so an empty one is never routine. Stack
+  // order is kept, so the cached prefix stays byte-stable between turns.
+  const curated = [...stacks.flat(), ...EXTERNAL_BLOCKS];
   const blocks = [
-    ...EXTERNAL_BLOCKS.map(slug => ({ slug, label: slug })),
+    ...curated.map(slug => ({ slug, label: slug })),
     ...manual.filter(b => audience === "subscriber" || !SUPPORT_ONLY_MANUAL.has(b.label)),
   ].filter((b, i, all) => all.findIndex(c => c.slug === b.slug) === i);
 
@@ -229,7 +250,7 @@ export async function groundingText(audience = "prospect") {
   const missing = [];
   for (const { block, items } of fetched) {
     if (!items.length) {
-      if (EXTERNAL_BLOCKS.includes(block.slug)) missing.push(block.slug);
+      if (curated.includes(block.slug)) missing.push(block.slug);
       continue;
     }
     sections.push(`### ${block.label}\n${items.map(f => `- ${cap(f)}`).join("\n")}`);

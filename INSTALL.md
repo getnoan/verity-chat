@@ -47,8 +47,9 @@ yours are, or take those lines out).
 
 Then pick the blocks it may answer FROM: `SITE_CHAT_GROUNDING_SLUGS` is a comma-separated
 list of block slugs (pricing, product, FAQs — whatever a visitor should get straight
-answers about). The service refuses to boot un-instructed rather than answer from general
-knowledge.
+answers about). `SITE_CHAT_GROUNDING_STACKS` is optional: stacks whose every block is
+customer-facing (your pricing, say), read whole so a plan you add later is not missed. The
+service refuses to boot un-instructed rather than answer from general knowledge.
 
 VERIFY: service log says "brain loaded from facts" after step 4.
 
@@ -109,4 +110,4 @@ shows its grounding to the visitor, files real support cases into your workspace
 leaves a memo on the contact after every conversation — with the spend capped by a number
 you chose.
 
-Exported from getnoan/agents @ 18835198.
+Exported from getnoan/agents @ aaf7a6e0.
