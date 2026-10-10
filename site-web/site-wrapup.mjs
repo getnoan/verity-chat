@@ -21,9 +21,7 @@ const MODEL = process.env.SITE_CHAT_WRAPUP_MODEL || "claude-sonnet-5";
 const GENERAL_ID = process.env.SITE_HUMAN_ASSIGNEE_ID || "";
 // A website-chat follow-up is inbound SALES and lands on the sales owner. It used to carry
 // the Sales tag and nobody, while the `general` route beside it named a person — so the
-// same traffic was owned or unowned depending on which branch it fell down. The owner is
-// Daniel since 2026-10-09: three follow-ups filed to the previous owner sat unread for up
-// to two months, so the route lands where the board is actually watched.
+// same traffic was owned or unowned depending on which branch it fell down.
 const SALES_ID = process.env.SITE_SALES_ASSIGNEE_ID || "";
 
 /* Routing stays in code because it is a WIRING table — which tag, which assignee — not a
