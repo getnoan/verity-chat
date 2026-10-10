@@ -110,4 +110,4 @@ shows its grounding to the visitor, files real support cases into your workspace
 leaves a memo on the contact after every conversation — with the spend capped by a number
 you chose.
 
-Exported from getnoan/agents @ 18154697.
+Exported from getnoan/agents @ ac9de49a.
