@@ -3,9 +3,9 @@
  * The site chat's daily spend cap fails CLOSED (site-web/budget.mjs).
  *
  * /chat is a public, unauthenticated endpoint on the operator's model key, so a cap that
- * cannot measure spend must refuse rather than wave everything through. It used to wave:
- * no metering configured → cap off, a failed read → cap off. A fresh deploy with the
- * api_usage table never created read as $0 spent forever. These cases pin the other way.
+ * cannot measure spend must refuse rather than wave everything through. No metering
+ * configured refuses, and so does a failed read, so a missing api_usage table never reads
+ * as $0 spent.
  *
  * Run:  node agents/test-site-budget.mjs
  */

@@ -11,10 +11,10 @@
  *   - a failed read (the api_usage table missing, Supabase down, a bad key) refuses too, and
  *     is retried after a minute rather than cached for the usual five.
  *
- * It used to fail OPEN on both, which made the documented worst case ("per day = this number")
- * false on exactly the installs least likely to notice: a fresh deploy whose api_usage table
- * was never created read as $0 spent, forever. SITE_DAILY_BUDGET_USD=0 still turns the cap
- * off — deliberately, by the operator — as it always did.
+ * Failing open would make the documented worst case ("per day = this number") false on the
+ * installs least likely to notice: a fresh deploy whose api_usage table was never created
+ * would read as $0 spent, forever. SITE_DAILY_BUDGET_USD=0 turns the cap off, deliberately,
+ * by the operator.
  */
 
 const TTL_OK_MS = 5 * 60_000;

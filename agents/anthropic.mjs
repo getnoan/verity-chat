@@ -36,10 +36,8 @@ import path from "node:path";
  * (api.openai.com and the like): those speak Chat Completions, and the request and response
  * bodies differ. That is a fact about one URL, not a limit on which models can be used.
  *
- * ANTHROPIC_API_KEY stays canonical: 32 fleet modules name it in their required-env arrays and
- * 31 workflows pass it as a secret, so renaming it would churn all of those and every Actions
- * secret for no functional gain. LLM_API_KEY is an alias for a user whose endpoint is not
- * Anthropic, for whom the Anthropic-shaped name is simply a lie. */
+ * ANTHROPIC_API_KEY stays canonical: fleet modules and workflows name it everywhere.
+ * LLM_API_KEY is an alias for a user whose endpoint is not Anthropic. */
 export const DEFAULT_BASE_URL = "https://api.anthropic.com";
 
 /** The base URL, trailing slashes stripped. A malformed value is a NAMED error here rather than
@@ -61,8 +59,7 @@ export const isAnthropicEndpoint = (env = process.env) => {
 };
 
 /* Say what degraded and whose problem it is, once per process. A gateway that ignores
- * cache_control still answers 200, so the only symptom of losing caching is the bill — which is
- * exactly how sixteen uncached agents went unnoticed until someone read the spend report. */
+ * cache_control still answers 200, so otherwise the only symptom of losing caching is the bill. */
 let announced = false;
 export function announceEndpoint(env = process.env, log = console.warn) {
   if (announced || isAnthropicEndpoint(env)) return;
@@ -73,11 +70,9 @@ export function announceEndpoint(env = process.env, log = console.warn) {
     + `to model ids your endpoint knows — the "claude-*" defaults will not resolve elsewhere.`);
 }
 
-/** The model key, or a named error — the exact shape of assertNoanKey() in noan.mjs, and here
- *  for the same reason: two names satisfy one requirement, so a plain presence check on one of
- *  them is wrong. Four shipped workers listed "ANTHROPIC_API_KEY" in their REQUIRED_ENV array,
- *  which would have refused to start for a user whose endpoint is not Anthropic — the endpoint
- *  being configurable is inert if the front door still demands one vendor's variable name. */
+/** The model key, or a named error. Two names satisfy one requirement, so never check for
+ *  ANTHROPIC_API_KEY alone (e.g. in a REQUIRED_ENV array): that refuses a user whose endpoint
+ *  is not Anthropic. */
 export function assertModelKey(env = process.env) {
   if (resolveKey(env)) return;
   throw new Error(
@@ -111,12 +106,10 @@ function mergeUsage(prev, next) {
   return out;
 }
 
-/** Ledger row for a stream that ended in an error AFTER the API had started billing it.
- *  Until 2026-10 these wrote nothing: the request was billed (input on message_start,
- *  output for every token generated before the fault) but only a completed call reached
- *  recordUsage, and the retry then paid again. September's ledger saw ~1.6M fewer output
- *  tokens than the Admin API billed on the fleet key. The action is suffixed so the
- *  report shows failed spend as its own line instead of folding it into the agent's. */
+/** Ledger row for a stream that ended in an error AFTER the API had started billing it
+ *  (input on message_start, output for every token generated before the fault). It must be
+ *  recorded before a retry pays again. The action is suffixed so the report shows failed
+ *  spend as its own line instead of folding it into the agent's. */
 async function recordFailedUsage(model, usage, action) {
   if (!usage) return;
   await recordUsage({ provider: "anthropic", model, usage, action: action ? `${action}-failed` : "stream-failed" });
@@ -147,10 +140,8 @@ function reconstruct(sseText) {
         const d = ev.delta;
         if (d.type === "text_delta") b.text = (b.text || "") + d.text;
         // NO onThinking here: reconstruct() is the batch path with no
-        // callbacks in scope — a stray call added with the thinking trace
-        // (PR #30) crashed every batch worker whenever the model emitted
-        // thinking (intermittent by nature of adaptive thinking; caught via
-        // a failed investor digest, 2026-08-06).
+        // callbacks in scope, so a call here crashes every batch worker
+        // whenever the model emits thinking.
         else if (d.type === "thinking_delta") b.thinking = (b.thinking || "") + d.thinking;
         else if (d.type === "signature_delta") b.signature = (b.signature || "") + d.signature;
         else if (d.type === "input_json_delta") b._json = (b._json || "") + d.partial_json;
@@ -192,13 +183,12 @@ function reconstruct(sseText) {
  */
 const RETRYABLE_STREAM_ERRORS = new Set(["overloaded_error", "api_error", "timeout_error"]);
 
-/* ---------------- prompt caching (VOICE-COST-PLAN phase 1) ----------------
+/* ---------------- prompt caching ----------------
  * Every request gets up to three ephemeral cache breakpoints: the tools
  * array (most stable — its own breakpoint so a system-prompt swap from a
  * brain refresh doesn't evict it), the system prompt, and the newest
  * message (so the whole conversation prefix reuses across turns AND across
- * iterations inside a tool loop). Cache reads bill at 10% of input; the
- * voice app's ~50-70k-token resent prefix was the bulk of its $60/day.
+ * iterations inside a tool loop). Cache reads bill at 10% of input.
  *
  * NON-MUTATING by construction: callers like the voice session hold their
  * `messages` array across turns — writing cache_control into their objects
@@ -241,7 +231,7 @@ export function withCacheBreakpoints(body) {
   return out;
 }
 
-/* ---------------- request dump (PROMPT CACHING BRIEF 2026-09-09, P2) ----------------
+/* ---------------- request dump ----------------
  * ANTHROPIC_DUMP_DIR=<dir> writes every request body AS SENT (cache_control
  * markers, stream flag, beta header) to <dir>/<iso-time>-<n>.json. It exists
  * to diagnose cache churn: log four or five consecutive payloads from one
@@ -270,7 +260,7 @@ function dumpRequest(body, headers) {
   }
 }
 
-/* Claude Opus 5 (2026-09-09): its safety classifiers can decline a request
+/* Claude Opus 5: its safety classifiers can decline a request
  * (HTTP 200, stop_reason "refusal"). Every Opus 5 request opts into
  * server-side refusal fallbacks by default so a declined call re-runs on
  * Anthropic's recommended substitute instead of failing the agent run.
@@ -287,26 +277,19 @@ function betaHeader(betas, body) {
   const list = [...(betas || [])];
   // `fallbacks` in the body without its beta header is a 400. Add the header
   // whether the helper chose fallbacks (Opus 5 default) or the caller passed
-  // them explicitly — the drafting agents that moved here from their own
-  // fetch (SDR first, 2026-09-09) used to set both by hand.
+  // them explicitly.
   const needsBeta = wantsFallbacks(body) || body?.fallbacks !== undefined;
   if (needsBeta && !list.includes(FALLBACK_BETA)) list.push(FALLBACK_BETA);
   return list.length ? { "anthropic-beta": list.join(",") } : {};
 }
 
-/* SHARED-HELPER CONTRACT NOTE (added 2026-08-13, FDA): `betas` is an optional
- * array of anthropic-beta header values. Omitted → header not sent; existing
- * callers see byte-identical requests. First caller: the FDA expert, which
- * opts into server-side refusal fallbacks on claude-opus-5. */
-/* SHARED-HELPER CONTRACT NOTE (added 2026-09-09, prompt caching brief P1):
- * post() is now exported as `postMessages` so the drafting agents that built
- * their own fetch to api.anthropic.com (sixteen of them, every one uncached)
- * can route through the breakpoints, retry ladder, usage ledger and Opus 5
- * fallbacks in one move. Two additive options:
- *   usage: { action }  — the spend-ledger action label ("draft", "tighten",
- *                        ...); the daily spend report keys on agent/action, so
- *                        a caller that used to pass one to recordUsage keeps it.
- *   (env) ANTHROPIC_DUMP_DIR — see dumpRequest above.
+/* SHARED-HELPER CONTRACT NOTE: post() is exported as `postMessages`, so every
+ * caller gets the cache breakpoints, retry ladder, usage ledger and Opus 5
+ * fallbacks. Optional, additive options:
+ *   betas: [...]       anthropic-beta header values. Omitted, no header is sent.
+ *   usage: { action }  the spend-ledger action label ("draft", "tighten", ...);
+ *                      the daily spend report keys on agent/action.
+ *   (env) ANTHROPIC_DUMP_DIR, see dumpRequest above.
  * Omitted, existing callers see byte-identical requests and ledger rows. */
 async function post(body, { retries = 4, timeoutMs = 15 * 60 * 1000, betas, usage: usageOpts } = {}) {
   announceEndpoint();
@@ -385,7 +368,7 @@ function firstText(data) {
 export async function callClaudeStream(body, { onText = () => {}, onThinking = () => {}, retries = 3, timeoutMs = 15 * 60 * 1000 } = {}) {
   let emitted = false;
   for (let attempt = 0; ; attempt++) {
-    // Per-call latency probes (VOICE-LATENCY-PLAN P0): wall-clock only,
+    // Per-call latency probes: wall-clock only,
     // set once each, returned on the result — never affects the stream.
     const t0 = Date.now();
     let tFirstByte = null, tFirstThink = null, tFirstOut = null;
@@ -473,7 +456,7 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
         }
       }
       // spend ledger (usage-log.mjs) — never throws. BEFORE the refusal check: a refused
-      // call is a completed, billed request, and throwing first left it out of the ledger.
+      // call is a completed, billed request, and throwing first would leave it out.
       await recordUsage({ provider: "anthropic", model: body.model, usage });
       if (stop_reason === "refusal") {
         throw new Error(`model refused: ${stop_details?.explanation || "no explanation"}`);
@@ -509,9 +492,9 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
  * Raw call for callers that need the full response (server tools, citations).
  * Handles the server-tool `pause_turn` continuation loop; refusal still throws.
  *
- * Content is ACCUMULATED across continuations — the first version returned
- * only the final turn, silently dropping cited text blocks produced before a
- * pause. The caller sees one merged content array, as if the turn never paused.
+ * Content is ACCUMULATED across continuations: returning only the final turn
+ * would drop cited text blocks produced before a pause. The caller sees one
+ * merged content array, as if the turn never paused.
  */
 export async function callClaudeRaw(body, { maxContinuations = 5, timeoutMs } = {}) {
   let messages = body.messages;
@@ -536,13 +519,9 @@ export async function callClaudeRaw(body, { maxContinuations = 5, timeoutMs } = 
  * call worth thinking about.
  */
 /**
- * One-shot text call. SHARED-HELPER CONTRACT NOTE (changed 2026-08-13):
- * `effort` and `thinking` are now OPT-OUT — pass `effort: null` /
- * `thinking: false` to omit output_config and the thinking block entirely.
- * Before this, output_config was always sent, which 400s on models that
- * don't support it (Haiku 4.5). Defaults are unchanged ("high" + adaptive),
- * so existing callers behave exactly as before; only callers that opt out
- * see different request bodies.
+ * One-shot text call. SHARED-HELPER CONTRACT NOTE: `effort` and `thinking`
+ * default to "high" + adaptive and are OPT-OUT: pass `effort: null` /
+ * `thinking: false` to omit them, for models that 400 on output_config (Haiku).
  */
 export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high", thinking = true }) {
   const body = {
@@ -584,7 +563,7 @@ export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxToke
  * Returns { terminal, toolCalls, elapsedMs }. terminal is what execTool
  * returned under __terminal, or {type:"budget_exceeded"|"stalled"}.
  */
-/* SHARED-HELPER CONTRACT NOTE (added 2026-08-13, FDA): `betas` (anthropic-beta
+/* SHARED-HELPER CONTRACT NOTE: `betas` (anthropic-beta
  * header values) and `extraBody` (spread into the request body, e.g.
  * { fallbacks: "default" }) are optional and additive — omitted, the request
  * is unchanged for existing callers. */
