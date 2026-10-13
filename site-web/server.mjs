@@ -22,14 +22,11 @@
  * IDENTITY. Every write takes the signed token, never a caller-supplied contactId. See
  * site-token.mjs for what that closes.
  *
- * COLD START. Netlify recycles isolates, and a cold one paid ~7s to first token even after
- * the grounding fetch was parallelised, against ~1.1s warm. A long-lived process holds that
- * cache, which is much of why this surface moved at all.
+ * COLD START. A long-lived process holds the grounding cache, so only a cold process pays
+ * the grounding fetch before its first token.
  *
- * NOT HERE YET. The demo-request and site-preview captures still run on Netlify. They are
- * independent of the chat, and site-preview alone is ~2,200 lines with a Firecrawl crawl and
- * a design-pack vocabulary; porting it in the same change would turn one reviewable diff
- * into two unreviewable ones. Phase 3 step 5 moves them.
+ * NOT HERE. The demo-request and site-preview captures run on Netlify, independent of the
+ * chat.
  */
 
 import { createServer } from "node:http";
@@ -124,8 +121,7 @@ function json(res, code, body) {
 }
 
 /* sendBeacon cannot set content-type: application/json without a preflight it will not wait
- * for, so /chat-end must accept text/plain and parse it itself. The same-origin route this
- * replaces never had to care. */
+ * for, so /chat-end must accept text/plain and parse it itself. */
 function readBody(req, limit = 512 * 1024) {
   return new Promise((resolve, reject) => {
     let n = 0; const chunks = [];
@@ -160,8 +156,8 @@ async function handleContact(req, res) {
   // /contacts). That is right for the unattended agent paths, where a refusal parks the work for
   // a human and costs nothing. Here it would 500 a live visitor mid-form. The trade-off inverts:
   // a blocked lead is worse than a rare duplicate, and a duplicate surfaces in the next weekly
-  // network-integrity run under assertion A, where it can be merged. So the website keeps its
-  // pre-2026-09-14 behaviour, and does so by name rather than by accident.
+  // network-integrity run under assertion A, where it can be merged. So the website sets it,
+  // by name.
   const { contact, created } = await findOrCreateContactByEmail(email, {
     name: clean(body.name, 120) || undefined,
     tagIds: LEAD_TAG_ID ? [LEAD_TAG_ID] : undefined,
@@ -187,7 +183,7 @@ async function handleChat(req, res) {
   const { turns, userTurns } = shape(body.history);
   if (!turns.length) return json(res, 400, { error: "empty history" });
   // userTurns counts everything submitted; `turns` is only the prompt window.
-  // Counting the window instead is what made this cap unreachable.
+  // Counting the window instead makes this cap unreachable.
   if (userTurns > MAX_TURNS) {
     return json(res, 429, { error: "This conversation has run long — start a new one." });
   }
@@ -202,7 +198,7 @@ async function handleChat(req, res) {
   }
 
   // Identity from the signed token only, never the body: isSubscriber gates the
-  // support-task path, so a caller-supplied flag was a caller-selectable privilege.
+  // support-task path, so a caller-supplied flag would be a caller-selectable privilege.
   const id = verifyChatToken(body.token);
   const audience = id?.isSubscriber ? "subscriber" : "prospect";
   const page = cleanPage(body.page);
@@ -447,15 +443,11 @@ async function createRoutedTask({ title, details, contactId, source, tags, assig
   return true;
 }
 
-/* Wrap-up dedupe. The route this replaced had one and the first port dropped it — a
- * regression, not a missing nicety: /chat-end is fired by sendBeacon, which is
+/* Wrap-up dedupe. /chat-end is fired by sendBeacon, which is
  * fire-and-forget and retry-prone, and a tab commonly fires BOTH visibilitychange:hidden
  * and pagehide. Without this, one closing tab writes the memo twice and files every
  * follow-up task twice, each of which is agent-assigned and therefore emails the contact.
- *
- * Over there it was explicitly "best-effort" because Cloudflare recycles isolates. Here the
- * process is long-lived, so the same guard is actually effective — which is the one place
- * this move makes an old compromise unnecessary rather than just faster. */
+ * The process is long-lived, so an in-process guard holds. */
 const WRAPPED_TTL_MS = 30 * 60_000;
 const wrapped = new Map();
 

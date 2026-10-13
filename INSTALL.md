@@ -23,7 +23,11 @@ email; replies need the keys below.
 
 ## 1. HUMAN — keys
 
-- A NOAN workspace + API key (https://app.getnoan.com → Settings → API keys) → `NOAN_AGENT_API_KEY`
+- A NOAN workspace (https://app.getnoan.com) and an agent key → `NOAN_AGENT_API_KEY`: create the
+  agent under Settings → Team, then its key under Settings → API → Agent API Keys. Everything the
+  chat writes (contacts, memos, support tasks) is then the agent's. A person's key works too, but
+  those writes are attributed to that person. Set `NOAN_EXPECT_BOT=1` and the service refuses every NOAN
+  call made with any other key.
 - An Anthropic API key (https://console.anthropic.com) → `ANTHROPIC_API_KEY`
 
 ## 2. The brain — three facts in your workspace
@@ -110,4 +114,4 @@ shows its grounding to the visitor, files real support cases into your workspace
 leaves a memo on the contact after every conversation — with the spend capped by a number
 you chose.
 
-Exported from getnoan/agents @ ac9de49a.
+Exported from getnoan/agents @ a30bfc0a.

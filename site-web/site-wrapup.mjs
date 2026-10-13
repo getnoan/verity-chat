@@ -1,9 +1,9 @@
 /**
  * Conversation wrap-up — the memo and the routed follow-ups.
  *
- * Port of chat-wrapup.server.ts, with two things it did not have: the routing table comes
- * from the Site Chat Agent Config fact rather than a hard-coded map, and the caller is
- * already token-verified, so this module never sees a contactId it was handed by a stranger.
+ * The routing table comes from the Site Chat Agent Config fact rather than a hard-coded map,
+ * and the caller is already token-verified, so this module never sees a contactId it was
+ * handed by a stranger.
  *
  * The memo goes to /memos. The deprecated /contacts/{id}/notes route is a view of the same
  * store, so readers on either field keep working.
@@ -19,9 +19,8 @@ import { brain } from "./site-chat.mjs";
 const MODEL = process.env.SITE_CHAT_WRAPUP_MODEL || "claude-sonnet-5";
 // Who owns a routed follow-up: NOAN identity ids. Unset = the task is filed with no assignee.
 const GENERAL_ID = process.env.SITE_HUMAN_ASSIGNEE_ID || "";
-// A website-chat follow-up is inbound SALES and lands on the sales owner. It used to carry
-// the Sales tag and nobody, while the `general` route beside it named a person — so the
-// same traffic was owned or unowned depending on which branch it fell down.
+// A website-chat follow-up is inbound SALES and lands on the sales owner. The `general` route
+// beside it names a person too, so the same traffic is owned whichever branch it falls down.
 const SALES_ID = process.env.SITE_SALES_ASSIGNEE_ID || "";
 
 /* Routing stays in code because it is a WIRING table — which tag, which assignee — not a

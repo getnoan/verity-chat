@@ -1,12 +1,11 @@
 /**
  * Signed chat session token.
  *
- * WHY IT EXISTS. The wrap-up endpoint used to take `contactId` straight from the request
- * body with no session, no signature and no origin check, then write a note and create up
- * to five tasks against that contact — tagged and ASSIGNED TO VERITY, which is the fleet's
- * trigger, so the support agent then emailed that contact. Anyone who could POST could put
- * mail in front of any person in the CRM. The reply endpoint had the mirror hole:
- * `isSubscriber` arrived from the client, making the support-task path caller-selectable.
+ * WHY IT EXISTS. The wrap-up endpoint writes a memo and creates up to five tasks against a
+ * contact, tagged and ASSIGNED TO VERITY, which is the fleet's trigger, so the support agent
+ * then emails that contact. Taking `contactId` from the request body would let anyone who
+ * can POST put mail in front of any person in the CRM. The reply endpoint has the mirror
+ * risk: an `isSubscriber` from the client would make the support-task path caller-selectable.
  *
  * The server issues a token where it resolves the contact — the one place that has actually
  * seen the email — and every later write verifies it. A caller can still obtain a token by
