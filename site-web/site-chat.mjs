@@ -10,6 +10,7 @@
  * should not have to touch API plumbing to retune business judgment.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { noanGet } from "../agents/noan.mjs";
 
 export const SUPPORT_TASK_MARKER = "SUPPORT_TASK:";
@@ -21,7 +22,11 @@ export const SUPPORT_TASK_RX = /\s*SUPPORT_TASK:\s*(\{[\s\S]*?\})\s*$/;
  * prospects: the whole point of the page is that a stranger with a company email can apply. */
 export const GRANT_MARKER = "GRANT_APPLICATION:";
 export const GRANT_RX = /\s*GRANT_APPLICATION:\s*(\{[\s\S]*?\})\s*$/;
-export const CONTROL_MARKERS = [SUPPORT_TASK_MARKER, GRANT_MARKER];
+/* The partner application (the partner page, see partnerPage below): the same mechanics on a
+ * second page, for a program that firms who implement for clients apply to. */
+export const PARTNER_MARKER = "PARTNER_APPLICATION:";
+export const PARTNER_RX = /\s*PARTNER_APPLICATION:\s*(\{[\s\S]*?\})\s*$/;
+export const CONTROL_MARKERS = [SUPPORT_TASK_MARKER, GRANT_MARKER, PARTNER_MARKER];
 
 const CONFIG_SLUG = process.env.SITE_CHAT_CONFIG_BLOCK_SLUG;
 const PLAYBOOK_SLUG = process.env.SITE_CHAT_PLAYBOOK_BLOCK_SLUG;
@@ -63,6 +68,27 @@ const FACTS_TTL_MS = 5 * 60_000;
 
 function log(...a) { console.log(...a); }
 
+/* ---------------- facts changed ----------------
+ * A caller that knows the fact layer moved (a webhook relay, say) can expire every cache
+ * below at once, so the next turn reads fresh facts instead of waiting out the TTLs. It
+ * EXPIRES rather than empties: the brain keeps its last good copy, which brain() still
+ * serves if NOAN is unreachable on the refetch. The route that calls this lives in
+ * server.mjs; FACTS_CHANGED_SECRET turns it on. */
+export function expireFactCaches() {
+  brainCache = { ...brainCache, at: 0 };
+  pauseCache = { ...pauseCache, at: 0 };
+  for (const [audience, hit] of factsCache) factsCache.set(audience, { ...hit, at: 0 });
+}
+
+/** True only for "Bearer <secret>" with the configured secret. Unset secret = never. */
+export function factsChangedAuthorized(header, secret) {
+  if (!secret) return false;
+  const given = String(header || "").replace(/^Bearer\s+/i, "");
+  const a = createHash("sha256").update(given).digest();
+  const b = createHash("sha256").update(secret).digest();
+  return timingSafeEqual(a, b);
+}
+
 async function factText(slug) {
   if (!slug) return "";
   const r = await noanGet(`/facts?block_slug=${encodeURIComponent(slug)}&per_page=1`);
@@ -102,11 +128,20 @@ let brainCache = { at: 0, brain: null };
 
 export async function brain() {
   if (brainCache.brain && Date.now() - brainCache.at < BRAIN_TTL_MS) return brainCache.brain;
-  const [config, playbook, application] = await Promise.all([
-    factText(CONFIG_SLUG),
-    factText(PLAYBOOK_SLUG).catch(() => ""),
-    factText(APPLICATION_SLUG).catch(() => ""),
-  ]);
+  let config, playbook, application, partner;
+  try {
+    [config, playbook, application, partner] = await Promise.all([
+      factText(CONFIG_SLUG),
+      factText(PLAYBOOK_SLUG).catch(() => ""),
+      factText(APPLICATION_SLUG).catch(() => ""),
+      factText(PARTNER_SLUG).catch(() => ""),
+    ]);
+  } catch (e) {
+    // NOAN unreachable: the last good brain beats a failed turn (expireFactCaches makes
+    // refetches more frequent, so this path is not hypothetical). Cold, there is none.
+    if (brainCache.brain) { log(`  warn: brain refetch failed (${e.message}) — serving the last good one`); return brainCache.brain; }
+    throw e;
+  }
   if (!config) {
     // A NOAN blip must never degrade a live surface, but booting un-instructed is worse
     // than not booting: the model would answer from general knowledge on a page that
@@ -114,7 +149,7 @@ export async function brain() {
     if (brainCache.brain) return brainCache.brain;
     throw new Error(`No fact in SITE_CHAT_CONFIG_BLOCK_SLUG '${CONFIG_SLUG}'. Refusing to run un-instructed.`);
   }
-  brainCache = { at: Date.now(), brain: { config, playbook, application } };
+  brainCache = { at: Date.now(), brain: { config, playbook, application, partner } };
   return brainCache.brain;
 }
 
@@ -396,8 +431,100 @@ export function parseGrantLine(rawText) {
   catch { return { reply, application: null }; }
 }
 
-export async function systemBlocks({ audience, email, name, supportTaskCreated, page, grantFiled = false }) {
-  const { config, playbook, application } = await brain();
+/* ---------------- the partner page ----------------
+ * A second application page, for the partner program: firms that implement for their own
+ * clients apply to resell and implement the product. Same shape as the application page
+ * above: the page (SITE_CHAT_PARTNER_PAGE) and the program (a fact, SITE_CHAT_PARTNER_BLOCK_SLUG:
+ * who qualifies, how joining works, what partners commit to) come from outside the code. */
+const PARTNER_SLUG = process.env.SITE_CHAT_PARTNER_BLOCK_SLUG;
+
+export function partnerPage() {
+  return cleanPage(process.env.SITE_CHAT_PARTNER_PAGE) || null;
+}
+
+export const PARTNER_FIRM_KINDS = ["agency", "consultancy", "advisor", "other", "unknown"];
+
+export function partnerBlock({ filed = false, program = "" } = {}) {
+  const PROGRAM = `## PROGRAM (who qualifies, how joining works, what partners commit to)\n${program.trim()}`;
+  if (filed) {
+    return [
+      "## Partner application: already filed",
+      "This visitor's partner application is already filed from this conversation. Do not take another. Answer questions about the program from PROGRAM below, and say the team reviews applications and replies by email within a week.",
+      "",
+      PROGRAM,
+    ].join("\n");
+  }
+  return [
+    "## Partner application mode",
+    "This page is the application for the partner program described under PROGRAM below. The visitor applies by talking to you. Run it as a short conversation between peers, never as a form: one or two questions per turn, in your own voice, skipping anything they have already told you.",
+    "",
+    "Collect, in this order:",
+    "1. Company name and website.",
+    "2. What kind of firm they are (agency, consultancy, independent advisor) and how many people work there.",
+    "3. What they implement for clients (brand, consulting, technology), with one example of work they delivered.",
+    "4. Who their clients are, and how widely those clients operate: how many locations, branches, regions or franchisees. Client names are welcome, never required.",
+    "5. Whether AI or agents are part of their client work today.",
+    "6. Whether they already use the product, and on which plan.",
+    "7. What partners commit to, as PROGRAM lists it. Read it out and ask whether they accept.",
+    "",
+    "Rules:",
+    "- Their email is already known. Never ask for it.",
+    "- Do not decide or predict the outcome. Never say they are approved, accepted or rejected, never say what is likely to happen to their application, and never pre-screen them out. The team reviews every application and replies by email within a week. If they ask what happens next, answer from PROGRAM.",
+    "- If they ask about eligibility or terms, answer plainly from PROGRAM. Never promise terms PROGRAM does not state.",
+    "- When every item is collected and the commitments are answered (accepted or declined, record either), read back a two-line summary, say the application is filed and the team replies within a week, and END that reply with the control line on its own last line, exactly in this shape:",
+    'PARTNER_APPLICATION: {"company":"","website":"","firmKind":"agency|consultancy|advisor|other|unknown","headcount":0,"implements":"","example":"","clients":"","clientLocations":"","aiWork":"","usesProduct":"","acceptsCommitments":true,"notes":""}',
+    "- Emit it once only, only when the application is complete, and never mention the control line or that anything is filed automatically.",
+    "",
+    PROGRAM,
+  ].join("\n");
+}
+
+/** Parse and bound a PARTNER_APPLICATION payload, clamped like an application above. */
+export function normalizePartnerApplication(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const str = (v, max) => String(v ?? "").replace(new RegExp("[\\u0000-\\u001f\\u007f<>]", "g"), " ").replace(/\s+/g, " ").trim().slice(0, max);
+  const int = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : 0; };
+  const kind = str(raw.firmKind, 24).toLowerCase();
+  let website = str(raw.website, 200);
+  if (website && !/^https?:\/\//i.test(website)) website = `https://${website}`;
+  let host = "";
+  try { host = website ? new URL(website).hostname.toLowerCase().replace(/^www\./, "") : ""; } catch { host = ""; }
+  if (!host.includes(".")) { website = ""; host = ""; }
+  return {
+    company: str(raw.company, 120),
+    website, host,
+    firmKind: PARTNER_FIRM_KINDS.includes(kind) ? kind : "unknown",
+    headcount: Math.min(int(raw.headcount), 1000000),
+    implements: str(raw.implements, 400),
+    example: str(raw.example, 600),
+    clients: str(raw.clients, 600),
+    clientLocations: str(raw.clientLocations, 400),
+    aiWork: str(raw.aiWork, 400),
+    usesProduct: str(raw.usesProduct, 160),
+    acceptsCommitments: raw.acceptsCommitments === true || /^(true|yes)$/i.test(String(raw.acceptsCommitments ?? "")),
+    notes: str(raw.notes, 600),
+  };
+}
+
+/** Split a reply into the text the visitor sees and the partner application it carried. */
+export function parsePartnerLine(rawText) {
+  const m = String(rawText ?? "").match(PARTNER_RX);
+  if (!m) return { reply: rawText, application: null };
+  const reply = String(rawText).replace(PARTNER_RX, "").trim();
+  try { return { reply, application: normalizePartnerApplication(JSON.parse(m[1])) }; }
+  catch { return { reply, application: null }; }
+}
+
+/** Where an applicant came from: "outreach" when the contact already carries the tag the team
+ *  puts on firms it approached first, "site" otherwise. */
+export function partnerSource(contact, outreachTagName) {
+  const want = String(outreachTagName || "").trim().toLowerCase();
+  if (!want) return "site";
+  return (contact?.tags || []).some(t => (t.name || "").toLowerCase() === want) ? "outreach" : "site";
+}
+
+export async function systemBlocks({ audience, email, name, supportTaskCreated, page, grantFiled = false, partnerFiled = false }) {
+  const { config, playbook, application, partner } = await brain();
   const facts = await groundingText(audience);
 
   const stable = [
@@ -419,6 +546,10 @@ export async function systemBlocks({ audience, email, name, supportTaskCreated, 
   const appPage = applicationPage();
   if (appPage && application && cleanPage(page) === appPage) {
     lines.push("", grantBlock({ filed: grantFiled, program: application }));
+  }
+  const ptPage = partnerPage();
+  if (ptPage && partner && cleanPage(page) === ptPage) {
+    lines.push("", partnerBlock({ filed: partnerFiled, program: partner }));
   }
   if (isSub) {
     lines.push(supportTaskCreated

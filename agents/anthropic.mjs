@@ -11,7 +11,7 @@
  * returns data, not a conversation. The model cannot return prose by accident.
  */
 
-import { recordUsage } from "./usage-log.mjs";
+import { recordUsage, recordUsageSoon } from "./usage-log.mjs";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -81,8 +81,7 @@ export function assertModelKey(env = process.env) {
     "string, so check the secret name first.");
 }
 
-const ANTHROPIC_URL = messagesUrl();
-const KEY = resolveKey();
+// Read per call: the Mac app loads this module before it restores keys from the Keychain.
 
 /** Model used for per-surface fact extraction (high volume, mechanical). */
 export const EXTRACT_MODEL = process.env.AUDIT_EXTRACT_MODEL || "claude-opus-5";
@@ -206,7 +205,10 @@ export function withCacheBreakpoints(body) {
   }
   if (typeof out.system === "string" && out.system) {
     out.system = [{ type: "text", text: out.system, cache_control: bp }];
-  } else if (Array.isArray(out.system) && out.system.length) {
+  } else if (Array.isArray(out.system) && out.system.length && !out.system.some(b => b?.cache_control)) {
+    // A caller that marked a block itself has split a stable prefix from a volatile tail
+    // (the hosted Slack belt: policy and rules first, "Now: 12:41 in Lisbon" last); marking
+    // the tail too would rewrite the cache on every call for nothing.
     out.system = out.system.slice();
     const li = out.system.length - 1;
     out.system[li] = { ...out.system[li], cache_control: bp };
@@ -266,6 +268,16 @@ function dumpRequest(body, headers) {
  * Anthropic's recommended substitute instead of failing the agent run.
  * Callers that already pass `fallbacks` (the FDA expert) are left alone. */
 const thinkingDefaultsOn = (m) => /^claude-(opus-5|sonnet-5)/.test(String(m || ""));
+/* How a model is told NOT to think. The 5.5 generation refuses `disabled` and asks for
+ * `between_tools` ("To turn thinking off on this model, send between_tools"); the 5
+ * generation refuses `between_tools`. Haiku has no thinking block at all and 400s on one.
+ * Probed live 2026-10-13 against opus-5, sonnet-5-5 and haiku-4-5. */
+export function thinkingOff(model) {
+  const m = String(model || "");
+  if (/^claude-(opus|sonnet)-5-5/.test(m)) return { type: "between_tools" };
+  if (thinkingDefaultsOn(m)) return { type: "disabled" };
+  return null;
+}
 const FALLBACK_BETA = "server-side-fallback-2026-07-01";
 function wantsFallbacks(body) {
   return String(body?.model || "").startsWith("claude-opus-5") && body?.fallbacks === undefined;
@@ -296,13 +308,13 @@ async function post(body, { retries = 4, timeoutMs = 15 * 60 * 1000, betas, usag
   for (let attempt = 0; ; attempt++) {
     const headers = {
       "Content-Type": "application/json",
-      "x-api-key": KEY,
+      "x-api-key": resolveKey(),
       "anthropic-version": "2023-06-01",
       ...betaHeader(betas, body),
     };
     const sent = { ...withFallbacks(withCacheBreakpoints(body)), stream: true };
     dumpRequest(sent, headers);
-    const res = await fetch(ANTHROPIC_URL, {
+    const res = await fetch(messagesUrl(), {
       method: "POST",
       headers,
       body: JSON.stringify(sent),
@@ -365,7 +377,10 @@ function firstText(data) {
  * once the user has heard words, a mid-stream failure surfaces instead of
  * silently restarting the sentence.
  */
-export async function callClaudeStream(body, { onText = () => {}, onThinking = () => {}, retries = 3, timeoutMs = 15 * 60 * 1000 } = {}) {
+// betas and onBlock are optional: omitted, the request and callbacks are unchanged.
+// onBlock gets each finished content block (an MCP tool call is reported this way).
+// awaitLedger false: the ledger row is written without holding up the return (a voice turn).
+export async function callClaudeStream(body, { onText = () => {}, onThinking = () => {}, onBlock = null, betas, retries = 3, timeoutMs = 15 * 60 * 1000, awaitLedger = true } = {}) {
   let emitted = false;
   for (let attempt = 0; ; attempt++) {
     // Per-call latency probes: wall-clock only,
@@ -377,13 +392,13 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
     try {
       const headers = {
         "Content-Type": "application/json",
-        "x-api-key": KEY,
+        "x-api-key": resolveKey(),
         "anthropic-version": "2023-06-01",
-        ...betaHeader(undefined, body),
+        ...betaHeader(betas, body),
       };
       const sent = { ...withFallbacks(withCacheBreakpoints(body)), stream: true };
       dumpRequest(sent, headers);
-      const res = await fetch(ANTHROPIC_URL, {
+      const res = await fetch(messagesUrl(), {
         method: "POST",
         headers,
         body: JSON.stringify(sent),
@@ -413,7 +428,7 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
               break;
             case "content_block_start": {
               const b = structuredClone(ev.content_block);
-              if (b.type === "tool_use" || b.type === "server_tool_use") b._json = "";
+              if (b.type === "tool_use" || b.type === "server_tool_use" || b.type === "mcp_tool_use") b._json = "";
               if (b.type === "thinking" && tFirstThink === null) tFirstThink = Date.now();
               if ((b.type === "text" || b.type === "tool_use") && tFirstOut === null) tFirstOut = Date.now();
               blocks[ev.index] = b;
@@ -438,6 +453,7 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
                 try { b.input = b._json ? JSON.parse(b._json) : (b.input || {}); } catch { /* keep b.input */ }
                 delete b._json;
               }
+              if (b && onBlock) { try { onBlock(b); } catch { /* the caller's problem, never the stream's */ } }
               break;
             }
             case "message_delta":
@@ -457,7 +473,8 @@ export async function callClaudeStream(body, { onText = () => {}, onThinking = (
       }
       // spend ledger (usage-log.mjs) — never throws. BEFORE the refusal check: a refused
       // call is a completed, billed request, and throwing first would leave it out.
-      await recordUsage({ provider: "anthropic", model: body.model, usage });
+      const row = { provider: "anthropic", model: body.model, usage };
+      if (awaitLedger) await recordUsage(row); else recordUsageSoon(row);
       if (stop_reason === "refusal") {
         throw new Error(`model refused: ${stop_details?.explanation || "no explanation"}`);
       }
@@ -523,7 +540,7 @@ export async function callClaudeRaw(body, { maxContinuations = 5, timeoutMs } = 
  * default to "high" + adaptive and are OPT-OUT: pass `effort: null` /
  * `thinking: false` to omit them, for models that 400 on output_config (Haiku).
  */
-export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high", thinking = true }) {
+export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high", thinking = true, usage }) {
   const body = {
     model,
     max_tokens: maxTokens,
@@ -536,9 +553,9 @@ export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxToke
   // sent as an explicit off (allowed at effort high or below).
   if (effort) body.output_config = { effort };
   if (thinking) body.thinking = { type: "adaptive" };
-  else if (thinkingDefaultsOn(model)) body.thinking = { type: "disabled" };
+  else if (thinkingOff(model)) body.thinking = thinkingOff(model);
 
-  const data = await post(body);
+  const data = await post(body, { usage });
   if (data.stop_reason === "refusal") {
     throw new Error(`model refused: ${data.stop_details?.explanation || "no explanation"}`);
   }
@@ -567,15 +584,31 @@ export async function callClaude({ system, user, model = ANALYSIS_MODEL, maxToke
  * header values) and `extraBody` (spread into the request body, e.g.
  * { fallbacks: "default" }) are optional and additive — omitted, the request
  * is unchanged for existing callers. */
+export const CONVERSATION_MAX_CHARS = 560_000, KEEP_RECENT_RESULTS = 4;
+export function trimConversation(messages, { maxChars = CONVERSATION_MAX_CHARS, keepRecent = KEEP_RECENT_RESULTS } = {}) {
+  let size = JSON.stringify(messages).length; if (size <= maxChars) return 0;
+  const results = [];
+  for (const m of messages) if (m.role === "user" && Array.isArray(m.content)) for (const b of m.content) if (b.type === "tool_result" && typeof b.content === "string" && b.content.length > 400) results.push(b);
+  let trimmed = 0;
+  for (const b of results.slice(0, Math.max(0, results.length - keepRecent))) {
+    if (size <= maxChars) break;
+    const cut = b.content.length - 400; b.content = `${b.content.slice(0, 300)}\n[... this earlier result was trimmed to keep the conversation within the model's window; ask for it again if you still need it]`; size -= cut; trimmed++;
+  }
+  return trimmed;
+}
 export async function callClaudeToolLoop({
   system, messages, tools, execTool,
   model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high",
   maxToolCalls = 40, maxWallMs = 30 * 60_000, log = () => {},
-  betas, extraBody,
+  betas, extraBody, usage,
   // Chat surfaces (the Slack companion): a reply with no tool call IS the
   // final answer — return it, never nudge toward finish/wait. Worker
   // surfaces keep the nudge: unattended runs must end in a terminal tool.
   textEndsTurn = false,
+  // Adaptive thinking on every round of a loop is most of a chat answer's bill
+  // (thinking is billed as output). `thinking: false` sends the model's own
+  // off form (thinkingOff); `effort: null` leaves output_config out for Haiku.
+  thinking = true,
 }) {
   const started = Date.now();
   let toolCalls = 0;
@@ -587,6 +620,9 @@ export async function callClaudeToolLoop({
     if (toolCalls >= maxToolCalls || elapsedMs >= maxWallMs) {
       return { terminal: { type: "budget_exceeded", toolCalls, elapsedMs }, toolCalls, elapsedMs, lastText };
     }
+    // A loop that has read a lot (thirteen long facts, 2026-10-21) can outgrow the context window and 400 on the next
+    // request. Past the ceiling, the oldest tool results are cut to a stub, the newest few kept whole; the stub says so.
+    trimConversation(messages);
 
     const data = await post({
       model,
@@ -594,10 +630,10 @@ export async function callClaudeToolLoop({
       system,
       tools,
       messages,
-      thinking: { type: "adaptive" },
-      output_config: { effort },
+      ...(thinking ? { thinking: { type: "adaptive" } } : thinkingOff(model) ? { thinking: thinkingOff(model) } : {}),
+      ...(effort ? { output_config: { effort } } : {}),
       ...(extraBody || {}),
-    }, { betas });
+    }, { betas, usage });
     if (data.stop_reason === "refusal") {
       throw new Error(`model refused: ${data.stop_details?.explanation || "no explanation"}`);
     }
@@ -617,6 +653,12 @@ export async function callClaudeToolLoop({
       continue;
     }
 
+    // A reply cut off at max_tokens in the middle of a tool call leaves that call's input unparsed (reconstruct keeps
+    // no input when the partial JSON does not parse). Running it with nothing made junk (an asset with no title,
+    // 2026-10-21), and the assistant turn then carried a tool_use with no input, which the next request 400s on.
+    // Such a call is not run: its input becomes {} so the turn stays valid, and its result tells the model to split.
+    const cutOff = data.stop_reason === "max_tokens";
+    for (const tu of toolUses) if (!tu.input || typeof tu.input !== "object") { tu.input = {}; tu._cutOff = true; }
     // Echo the assistant turn verbatim BEFORE executing — thinking blocks must
     // ride along unchanged or the next request 400s.
     messages.push({ role: "assistant", content: data.content });
@@ -625,8 +667,13 @@ export async function callClaudeToolLoop({
     for (const tu of toolUses) {
       toolCalls++;
       let out;
-      try { out = await execTool(tu.name, tu.input || {}); }
-      catch (e) { out = { error: e.message }; }
+      if (tu._cutOff || (cutOff && tu === toolUses[toolUses.length - 1])) {
+        delete tu._cutOff;
+        out = { error: `This ${tu.name} call was cut off by the output limit (${maxTokens} tokens) before it was complete, so it was not run. Make it smaller: write less per call, or split the content across calls (for a long document, create it short and add the rest with a revision).` };
+      } else {
+        try { out = await execTool(tu.name, tu.input || {}); }
+        catch (e) { out = { error: e.message }; }
+      }
       log(`    tool ${tu.name} (${toolCalls}/${maxToolCalls})${out?.error ? ` → error: ${out.error.slice(0, 120)}` : ""}`);
       if (out && out.__terminal) {
         return { terminal: out.__terminal, toolCalls, elapsedMs: Date.now() - started, lastText };
@@ -652,18 +699,19 @@ export async function callClaudeToolLoop({
  * list every key in `required` — the API enforces this.
  * Hosted callers can bound timeoutMs/retries; omitted values preserve fleet defaults.
  */
-export async function callClaudeJSON({ system, user, schema, model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high", thinking = true, timeoutMs, retries }) {
+export async function callClaudeJSON({ system, user, schema, model = ANALYSIS_MODEL, maxTokens = 8000, effort = "high", thinking = true, timeoutMs, retries, usage }) {
   const body = {
     model,
     max_tokens: maxTokens,
     system,
     messages: [{ role: "user", content: user }],
-    output_config: { effort, format: { type: "json_schema", schema } },
+    // effort is an Opus/Sonnet-tier parameter; `effort: null` leaves it out so Haiku takes the call.
+    output_config: { ...(effort ? { effort } : {}), format: { type: "json_schema", schema } },
   };
   if (thinking) body.thinking = { type: "adaptive" };
-  else if (thinkingDefaultsOn(model)) body.thinking = { type: "disabled" };
+  else if (thinkingOff(model)) body.thinking = thinkingOff(model);
 
-  const data = await post(body, { timeoutMs, retries });
+  const data = await post(body, { timeoutMs, retries, usage });
   if (data.stop_reason === "refusal") {
     throw new Error(`model refused: ${data.stop_details?.explanation || "no explanation"}`);
   }

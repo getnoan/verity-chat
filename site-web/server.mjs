@@ -10,13 +10,22 @@
  *   POST /contact     resolve the visitor's contact, return a signed session token
  *   POST /chat        streaming reply (SSE)
  *   POST /chat-end    conversation wrap-up — memo + routed tasks
+ *   POST /internal/facts-changed   expire the fact caches now (Bearer FACTS_CHANGED_SECRET;
+ *                     404 when unset). For a webhook relay that knows the fact layer moved.
  *
  * THE APPLICATION PAGE (SITE_CHAT_APPLICATION_PAGE, the program in a fact). On that page
  * the chat IS the application form: the brain interviews the visitor against the program's
  * published criteria and ends the completing reply with a GRANT_APPLICATION control line.
  * This server tags the contact (SITE_GRANT_TAG_ID, "Grant Applicant" by name otherwise),
  * writes the answers to the contact as a memo, and files a backlog task tagged the same,
- * unassigned: awarding a grant is a human decision, so no agent trigger shape.
+ * assigned to SITE_GRANT_ASSIGNEE_IDS when set: awarding a grant is a human decision, so never
+ * to the agent.
+ *
+ * THE PARTNER PAGE (SITE_CHAT_PARTNER_PAGE, a second program in a fact) works the same way with a
+ * PARTNER_APPLICATION control line: the contact and a backlog task are tagged
+ * (SITE_PARTNER_TAG_ID, "Partner Applicant" by name otherwise), the answers go on the contact,
+ * and the task is assigned to SITE_PARTNER_ASSIGNEE_IDS when set, so a person sees it.
+ * SITE_PARTNER_NOTIFY_TO, when set, is emailed the application as soon as the task exists.
  *   GET  /healthz
  *
  * IDENTITY. Every write takes the signed token, never a caller-supplied contactId. See
@@ -41,7 +50,8 @@ import { sendEmail } from "../agents/resend.mjs";
 import { createBudgetGate, describeBudget } from "./budget.mjs";
 import {
   brain, paused, systemBlocks, createMarkerFilter, prepareTurns, SUPPORT_TASK_RX,
-  cleanPage, groundingLabels, parseGrantLine, applicationPage,
+  cleanPage, groundingLabels, parseGrantLine, applicationPage, parsePartnerLine, partnerPage, partnerSource,
+  expireFactCaches, factsChangedAuthorized,
 } from "./site-chat.mjs";
 import { issueChatToken, verifyChatToken } from "./site-token.mjs";
 import { agentName, agentIdentityId } from "../agents/required-env.mjs";
@@ -79,6 +89,19 @@ const SUBSCRIBER_TAG_ID = (process.env.SITE_SUBSCRIBER_TAG_ID || "").trim() || n
  * file time, so a downstream copy only needs a tag called this. */
 const GRANT_TAG_ID = (process.env.SITE_GRANT_TAG_ID || "").trim() || null;
 const GRANT_TAG_NAME = (process.env.SITE_GRANT_TAG_NAME || "").trim() || "Grant Applicant";
+/* Who reviews a filed grant application, as identity ids. None by default; set it so a
+ * person, not only the tag, owns each application on the board. */
+const GRANT_ASSIGNEE_IDS = (process.env.SITE_GRANT_ASSIGNEE_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+/* The partner applicant tag, resolved the same way. The outreach tag only labels where an
+ * applicant came from (a contact the team already approached carries it); unresolved, every
+ * application reads as from the site. Assignees are identity ids, none by default. */
+const PARTNER_TAG_ID = (process.env.SITE_PARTNER_TAG_ID || "").trim() || null;
+const PARTNER_TAG_NAME = (process.env.SITE_PARTNER_TAG_NAME || "").trim() || "Partner Applicant";
+const PARTNER_OUTREACH_TAG_NAME = (process.env.SITE_PARTNER_OUTREACH_TAG_NAME || "").trim() || "Potential Partner";
+const PARTNER_ASSIGNEE_IDS = (process.env.SITE_PARTNER_ASSIGNEE_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+/* Who is emailed when a partner application is filed. No default (the pack rule): unset, the
+ * board task is the only notice. */
+const PARTNER_NOTIFY_TO = (process.env.SITE_PARTNER_NOTIFY_TO || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const ALLOWED_ORIGINS = (process.env.SITE_ALLOWED_ORIGINS || "")
   .split(",").map(s => s.trim()).filter(Boolean);
@@ -205,6 +228,7 @@ async function handleChat(req, res) {
   // The client's flag rides the session like supportTaskCreated; the in-process map is
   // the second guard, for a tab that lost its session but not its transcript.
   const grantAlready = body.grantFiled === true || (id ? grantFiledRecently(id.contactId) : false);
+  const partnerAlready = body.partnerFiled === true || (id ? partnerFiledRecently(id.contactId) : false);
   const system = await systemBlocks({
     audience,
     email: id?.email,
@@ -212,6 +236,7 @@ async function handleChat(req, res) {
     supportTaskCreated: body.supportTaskCreated === true,
     page,
     grantFiled: grantAlready,
+    partnerFiled: partnerAlready,
   });
 
   res.writeHead(200, {
@@ -270,11 +295,21 @@ async function handleChat(req, res) {
     if (grant.grantFiled && !grantAlready) {
       send({ trace: { glyph: "\u270e", label: "application", detail: `grant application filed for the team \u00b7 tagged ${GRANT_TAG_NAME}`, tone: "write" } });
     }
+    const partnerApp = await applyPartnerLine(grant.reply, {
+      contactId: id?.contactId,
+      email: id?.email,
+      page,
+      already: partnerAlready,
+    });
+    if (partnerApp.partnerFiled && !partnerAlready) {
+      send({ trace: { glyph: "\u270e", label: "application", detail: `partner application filed for the team \u00b7 tagged ${PARTNER_TAG_NAME}`, tone: "write" } });
+    }
     send({
       done: true,
-      reply: grant.reply || "Sorry, I didn't catch that.",
+      reply: partnerApp.reply || "Sorry, I didn't catch that.",
       supportTaskCreated: support.supportTaskCreated,
       grantFiled: grant.grantFiled,
+      partnerFiled: partnerApp.partnerFiled,
     });
   } catch (e) {
     console.error("[site-chat] reply failed:", e.message);
@@ -411,7 +446,133 @@ async function fileGrantApplication({ contactId, email, application, lines }) {
   if (!taskId) throw new Error("task create returned no id");
   await noanPut(`/tasks/${taskId}/tags`, { tagIds: [tagId] });
   await noanPut(`/tasks/${taskId}/contacts`, { contactIds: [contactId] }).catch(e => console.error("  contact link failed:", e.message));
+  if (GRANT_ASSIGNEE_IDS.length) {
+    await noanPut(`/tasks/${taskId}/assignees`, { assigneeIds: GRANT_ASSIGNEE_IDS }).catch(e => console.error("  assignee link failed:", e.message));
+  }
   return taskId;
+}
+
+/* ---------------- PARTNER_APPLICATION control line ----------------
+ * The grant's mechanics on the partner page: acted on once, only on that page, only for a
+ * token-verified contact, with the same in-process guard against a second filing. */
+const partnersFiled = new Map();   // contactId -> at
+
+function partnerFiledRecently(contactId) {
+  const at = partnersFiled.get(contactId);
+  if (!at) return false;
+  if (Date.now() - at > GRANT_TTL_MS) { partnersFiled.delete(contactId); return false; }
+  return true;
+}
+
+function partnerLines(a, email) {
+  const yn = v => (v ? "yes" : "no");
+  return [
+    `Company: ${a.company || "(not given)"}`,
+    `Website: ${a.website || "(not given)"}`,
+    `Applicant email: ${email}`,
+    `Kind of firm: ${a.firmKind}`,
+    `Team size: ${a.headcount || "(not given)"}`,
+    `Implements for clients: ${a.implements || "(not given)"}`,
+    `Example of delivered work: ${a.example || "(not given)"}`,
+    `Clients: ${a.clients || "(not given)"}`,
+    `Client locations: ${a.clientLocations || "(not given)"}`,
+    `AI or agent work: ${a.aiWork || "(not given)"}`,
+    `Uses the product: ${a.usesProduct || "(not given)"}`,
+    `Accepts the partner commitments: ${yn(a.acceptsCommitments)}`,
+    ...(a.notes ? [`Notes: ${a.notes}`] : []),
+  ];
+}
+
+async function applyPartnerLine(rawText, ctx, file = filePartnerApplication) {
+  const { reply, application } = parsePartnerLine(rawText);
+  if (!application) return { reply: rawText, partnerFiled: ctx.already === true };
+  const ptPage = partnerPage();
+  if (!ctx.contactId || !ctx.email || !ptPage || ctx.page !== ptPage || ctx.already) {
+    return { reply, partnerFiled: ctx.already === true };
+  }
+  partnersFiled.set(ctx.contactId, Date.now());
+  const lines = partnerLines(application, ctx.email);
+  try {
+    await file({ contactId: ctx.contactId, email: ctx.email, application, lines });
+    return { reply, partnerFiled: true };
+  } catch (e) {
+    console.error("[site-chat] partner application failed:", e.message);
+    // The visitor has been told it is filed. Put the answers in front of a person instead.
+    const text = `${agentName()} took a partner application on ${ptPage} but writing it to NOAN failed (${e.message}).\n\n${lines.join("\n")}\n\nContact ID: ${ctx.contactId}`;
+    if (!ESCALATE_TO) console.error(`[site-chat] no ESCALATE_TO; application follows\n${text}`);
+    else sendEmail({
+      to: ESCALATE_TO, cc: false,
+      subject: `Partner application NOT filed for ${application.company || ctx.email}`,
+      text,
+      idempotencyKey: `site-chat:partner-failed:${ctx.contactId}:${new Date().toISOString().slice(0, 10)}`,
+    }).catch(() => {});
+    return { reply, partnerFiled: true };
+  }
+}
+
+/** Contact tagged, website filled in if empty, answers on the record, task on the board. */
+async function filePartnerApplication({ contactId, email, application, lines }) {
+  const tagId = PARTNER_TAG_ID || await findTagId(PARTNER_TAG_NAME);
+  if (!tagId) throw new Error(`no "${PARTNER_TAG_NAME}" tag: set SITE_PARTNER_TAG_ID or create the tag`);
+
+  const full = await noanGet(`/contacts/${contactId}`);
+  const contact = full?.contact || full || {};
+  const source = partnerSource(contact, PARTNER_OUTREACH_TAG_NAME);
+  const current = (contact.tags || []).map(t => t.id).filter(Boolean);
+  const patch = { tagIds: [...new Set([...current, tagId])] };
+  if (!contact.website && application.website) patch.website = application.website;
+  await noanPatch(`/contacts/${contactId}`, patch);
+
+  await addContactMemo(
+    contactId,
+    `Partner application (${new Date().toISOString()}), taken by ${agentName()} in the site chat. Source: ${source}.\n\n${lines.join("\n")}`,
+    "Partner application",
+  ).catch(e => console.error("  partner memo failed:", e.message));
+
+  const created = await noanPost("/tasks", {
+    title: `Partner application: ${application.company || application.host || email}`.slice(0, 200),
+    details: [
+      `Partner application, taken in the site chat on ${partnerPage() || "the partner page"}. Source: ${source}.`,
+      "Review against the published criteria and reply to the applicant by email within a week.",
+      "",
+      ...lines,
+      "",
+      `Contact ID: ${contactId}`,
+      `Source: site chat, ${partnerPage() || "partner page"}`,
+    ].join("\n").slice(0, 2048),
+    status: "backlog",
+    externalId: `site-partner:${contactId}`,
+  });
+  const taskId = created?.task?.id || created?.id;
+  if (!taskId) throw new Error("task create returned no id");
+  await noanPut(`/tasks/${taskId}/tags`, { tagIds: [tagId] });
+  await noanPut(`/tasks/${taskId}/contacts`, { contactIds: [contactId] }).catch(e => console.error("  contact link failed:", e.message));
+  if (PARTNER_ASSIGNEE_IDS.length) {
+    await noanPut(`/tasks/${taskId}/assignees`, { assigneeIds: PARTNER_ASSIGNEE_IDS }).catch(e => console.error("  assignee link failed:", e.message));
+  }
+  // The task is filed whatever happens here: a failed notice is logged, never a failed application.
+  if (PARTNER_NOTIFY_TO.length) {
+    await sendEmail(partnerNotice({ to: PARTNER_NOTIFY_TO, application, lines, source, taskId, contactId })).catch(e => console.error("  partner notice failed:", e.message));
+  }
+  return taskId;
+}
+
+/** The email to the people who review partner applications. Plain text, one per task. */
+export function partnerNotice({ to, application, lines, source, taskId, contactId }) {
+  const who = application.company || application.host || "a new applicant";
+  return {
+    to, cc: false,
+    subject: `New partner application: ${who}`,
+    text: [
+      `${agentName()} took a partner application in the site chat (source: ${source}). It is on the board as a backlog task, "Partner application: ${who}".`,
+      "",
+      ...lines,
+      "",
+      `Task ID: ${taskId}`,
+      `Contact ID: ${contactId}`,
+    ].join("\n"),
+    idempotencyKey: `site-chat:partner-notify:${taskId}`,
+  };
 }
 
 /** A backlog task, tagged and optionally assigned to the agent, with the contact linked. Tag +
@@ -478,6 +639,7 @@ async function handleChatEnd(req, res) {
       identity: id, turns, createRoutedTask,
       alreadySupported: body.supportTaskCreated === true,
       grantFiled: body.grantFiled === true || grantFiledRecently(id.contactId),
+      partnerFiled: body.partnerFiled === true || partnerFiledRecently(id.contactId),
       externalIdBase: `site-chat:${id.contactId}:${sessionId}`,
     });
     json(res, 200, { ok: true, ...r });
@@ -518,6 +680,16 @@ async function route(req, res) {
   /* A deployment-only route (optionalRoute above): a GET a person opens from an email, so no
    * CORS and no token cookie; the signed query string is the whole credential. */
   if (req.method === "GET" && url.pathname === "/grant/activate" && handleGrantActivate) return await handleGrantActivate(req, res, url);
+  /* Service-to-service, not a browser route: no CORS, a shared secret, and nothing but
+   * cache expiry behind it, so a leaked secret costs refetches, never data. */
+  if (req.method === "POST" && url.pathname === "/internal/facts-changed") {
+    const secret = process.env.FACTS_CHANGED_SECRET || "";
+    if (!secret) { res.writeHead(404); res.end(); return; }
+    if (!factsChangedAuthorized(req.headers.authorization, secret)) { res.writeHead(401); res.end(); return; }
+    expireFactCaches();
+    console.log("[site-chat] facts changed: caches expired");
+    return json(res, 200, { ok: true });
+  }
   if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
 
   try {
@@ -556,4 +728,4 @@ if (process.env.NODE_ENV !== "test") {
   });
 }
 
-export { server, route, createRoutedTask, applyGrantLine };
+export { server, route, createRoutedTask, applyGrantLine, applyPartnerLine };
